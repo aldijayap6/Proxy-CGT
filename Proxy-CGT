@@ -1,0 +1,570 @@
+-- ==========================================
+-- KONFIGURASI MODERATION PROXY (ON-DEMAND + WRENCH)
+-- ==========================================
+local CMD_DELAY = CMD_DELAY or 1100 -- Jeda tunggu balasan command server (ms)
+-- ==========================================
+
+local state = {
+    growid = "",
+    userid = "",
+    dateCreated = "-",
+    lastLogin = "-",
+    verified = "Tidak",
+    discord = "-",
+    hrs = "-",
+    ip = "-",
+
+    -- Data on-demand
+    ridHeader = "",
+    ridAccounts = {},
+    seenRid = {},
+
+    ipHeader = "",
+    ipAccounts = {},
+    seenIp = {},
+
+    ipInfoOrg = "-",
+    ipInfoHostname = "-",
+    ipInfoLocation = "-",
+    ipInfoTimezone = "-",
+    ipInfoPostal = "-",
+
+    -- Status perekaman & mode
+    capturing = false,
+    capturePhase = nil, -- "INFO", "RID", "IP"
+    wrenchMode = false,
+    injectBackInNextDialog = false
+}
+
+local pendingAction = nil   -- "INFO", "RID", "IP", "IPINFO"
+local pendingTarget = nil
+
+local function stripColor(str)
+    return (tostring(str or ""):gsub("`.", ""))
+end
+
+local function safeDlg(str)
+    return tostring(str or "-"):gsub("|", "/"):gsub("[\r\n]", " ")
+end
+
+local function sendCmd(cmd)
+    SendPacket(2, "action|input\n|text|" .. cmd)
+end
+
+-- ==========================================
+-- 1. DIALOG UTAMA: ACCOUNT OVERVIEW (/acc)
+-- ==========================================
+local function showOverviewDialog()
+    local gid = state.growid ~= "" and safeDlg(state.growid) or "Unknown"
+    local uidDisplay = state.userid ~= "" and ("#" .. safeDlg(state.userid)) or "-"
+    local verColor = state.verified == "Iya" and "`2Iya" or "`4Tidak"
+
+    local d = {
+        "set_default_color|`o",
+        "add_label_with_icon|big|`w" .. gid .. "'s Account Info``|left|32|",
+        "add_textbox|Ringkasan informasi akun dari /info:|left|",
+        "add_spacer|small|",
+        "add_textbox|`wGrowID: `2" .. gid .. "``|left|",
+        "add_textbox|`wUserID: `2" .. uidDisplay .. "``|left|",
+        "add_textbox|`wDate Created: `o" .. safeDlg(state.dateCreated) .. "``|left|",
+        "add_textbox|`wLast Login: `o" .. safeDlg(state.lastLogin) .. "``|left|",
+        "add_textbox|`wVerified: " .. verColor .. "``|left|",
+        "add_textbox|`wDiscord: `2" .. safeDlg(state.discord) .. "``|left|",
+        "add_textbox|`wHrs (Playtime): `2" .. safeDlg(state.hrs) .. "``|left|",
+        "add_spacer|small|",
+        "add_label|small|`wMenu Pemeriksaan Lanjutan``|left|",
+        "add_button|btn_act_ridcheck|`wRIDCheck``|noflags|0|0|",
+        "add_button|btn_act_ipcheck|`wIPCheck``|noflags|0|0|",
+        "add_button|btn_act_ipinfo|`wIPInfo (" .. safeDlg(state.ip) .. ")``|noflags|0|0|",
+        "add_button|btn_act_inventory|`wInventory``|noflags|0|0|",
+        "add_button|btn_act_profile|`wProfile``|noflags|0|0|",
+        "add_spacer|small|",
+        "end_dialog|proxy_main_overview|Close||"
+    }
+
+    Client.ShowDialog(table.concat(d, "\n"))
+end
+
+-- ==========================================
+-- 2. DIALOG HASIL RIDCHECK
+-- ==========================================
+local function showRidResultDialog()
+    local gid = state.growid ~= "" and safeDlg(state.growid) or "Unknown"
+    local d = {
+        "set_default_color|`o",
+        "add_label_with_icon|big|`wRIDCheck: " .. gid .. "``|left|32|",
+        "add_textbox|`wHasil: `o" .. safeDlg(state.ridHeader ~= "" and state.ridHeader or "Selesai") .. "``|left|",
+        "add_spacer|small|"
+    }
+
+    if #state.ridAccounts > 0 then
+        for i, acc in ipairs(state.ridAccounts) do
+            local stTag = acc.status == "ON" and "`2[ON] " or (acc.status == "OFF" and "`4[OFF] " or "")
+            local label = string.format("`w%d. %s`2%s `o(UserID: `w#%s`o | Score: `w%s`o)", i, stTag, acc.name, acc.uid, acc.score)
+            d[#d + 1] = "add_textbox|" .. label .. "|left|"
+            d[#d + 1] = "add_button|btn_inspect_acc_" .. acc.name .. "|`wInspect: " .. acc.name .. "``|noflags|0|0|"
+        end
+    else
+        d[#d + 1] = "add_textbox|`oTidak ada akun RID terkait yang ditemukan.``|left|"
+    end
+
+    d[#d + 1] = "add_spacer|small|"
+    d[#d + 1] = "add_button|btn_back_overview|`wBack``|noflags|0|0|"
+    d[#d + 1] = "end_dialog|proxy_rid_result|Close||"
+
+    Client.ShowDialog(table.concat(d, "\n"))
+end
+
+-- ==========================================
+-- 3. DIALOG HASIL IPCHECK
+-- ==========================================
+local function showIpCheckResultDialog()
+    local gid = state.growid ~= "" and safeDlg(state.growid) or "Unknown"
+    local d = {
+        "set_default_color|`o",
+        "add_label_with_icon|big|`wIPCheck: " .. gid .. "``|left|32|",
+        "add_textbox|`wIP Target: `o" .. safeDlg(state.ip) .. "``|left|",
+        "add_textbox|`wHasil: `o" .. safeDlg(state.ipHeader ~= "" and state.ipHeader or "Selesai") .. "``|left|",
+        "add_spacer|small|"
+    }
+
+    if #state.ipAccounts > 0 then
+        for i, acc in ipairs(state.ipAccounts) do
+            local stTag = acc.status == "ON" and "`2[ON] " or (acc.status == "OFF" and "`4[OFF] " or "")
+            local label = string.format("`w%d. %s`2%s `o(UserID: `w#%s`o | Score: `w%s`o)", i, stTag, acc.name, acc.uid, acc.score)
+            d[#d + 1] = "add_textbox|" .. label .. "|left|"
+            d[#d + 1] = "add_button|btn_inspect_acc_" .. acc.name .. "|`wInspect: " .. acc.name .. "``|noflags|0|0|"
+        end
+    else
+        d[#d + 1] = "add_textbox|`oTidak ada akun IP terkait yang ditemukan.``|left|"
+    end
+
+    d[#d + 1] = "add_spacer|small|"
+    d[#d + 1] = "add_button|btn_back_overview|`wBack``|noflags|0|0|"
+    d[#d + 1] = "end_dialog|proxy_ip_result|Close||"
+
+    Client.ShowDialog(table.concat(d, "\n"))
+end
+
+-- ==========================================
+-- 4. DIALOG HASIL IPINFO.IO
+-- ==========================================
+local function showIpInfoDialog()
+    local gid = state.growid ~= "" and safeDlg(state.growid) or "Unknown"
+    local d = {
+        "set_default_color|`o",
+        "add_label_with_icon|big|`wIPInfo: " .. gid .. "``|left|32|",
+        "add_textbox|`wIP Address: `2" .. safeDlg(state.ip) .. "``|left|",
+        "add_spacer|small|",
+        "add_textbox|`wLocation: `2" .. safeDlg(state.ipInfoLocation) .. "``|left|",
+        "add_textbox|`wOrg / ASN: `2" .. safeDlg(state.ipInfoOrg) .. "``|left|",
+        "add_textbox|`wHostname: `o" .. safeDlg(state.ipInfoHostname) .. "``|left|",
+        "add_textbox|`wTimezone: `o" .. safeDlg(state.ipInfoTimezone) .. "``|left|",
+        "add_textbox|`wPostal: `o" .. safeDlg(state.ipInfoPostal) .. "``|left|",
+        "add_spacer|small|",
+        "add_button|btn_back_overview|`wBack``|noflags|0|0|",
+        "end_dialog|proxy_ipinfo_result|Close||"
+    }
+
+    Client.ShowDialog(table.concat(d, "\n"))
+end
+
+-- ==========================================
+-- FUNGSI AMBIL DATA IPINFO.IO (CEPAT & ANTI-HANG)
+-- ==========================================
+local function fetchIpInfoData(ipAddress)
+    state.ipInfoOrg = "-"
+    state.ipInfoHostname = "-"
+    state.ipInfoLocation = "-"
+    state.ipInfoTimezone = "-"
+    state.ipInfoPostal = "-"
+
+    if not ipAddress or ipAddress == "-" or not ipAddress:match("^%d+%.%d+%.%d+%.%d+$") then
+        state.ipInfoLocation = "IP tidak terbaca dari /info"
+        return
+    end
+
+    local res = MakeRequest("https://ipinfo.io/" .. ipAddress .. "/json", "GET", { ["User-Agent"] = "Mozilla/5.0" }, "", 3000)
+    if res and not res.error and res.status == 200 and res.content and res.content:find("{", 1, true) then
+        local body = res.content
+        state.ipInfoOrg = body:match('"org"%s*:%s*"([^"]*)"') or "-"
+        state.ipInfoHostname = body:match('"hostname"%s*:%s*"([^"]*)"') or "-"
+        state.ipInfoTimezone = body:match('"timezone"%s*:%s*"([^"]*)"') or "-"
+        state.ipInfoPostal = body:match('"postal"%s*:%s*"([^"]*)"') or "-"
+
+        local city = body:match('"city"%s*:%s*"([^"]*)"') or ""
+        local region = body:match('"region"%s*:%s*"([^"]*)"') or ""
+        local country = body:match('"country"%s*:%s*"([^"]*)"') or ""
+
+        local loc = {}
+        if city ~= "" then loc[#loc + 1] = city end
+        if region ~= "" and region ~= city then loc[#loc + 1] = region end
+        if country ~= "" then loc[#loc + 1] = country end
+        state.ipInfoLocation = #loc > 0 and table.concat(loc, ", ") or "-"
+        return
+    end
+
+    local res2 = MakeRequest("http://ip-api.com/json/" .. ipAddress .. "?fields=status,countryCode,regionName,city,zip,timezone,as,isp", "GET", { ["User-Agent"] = "Mozilla/5.0" }, "", 3000)
+    if res2 and not res2.error and res2.status == 200 and res2.content then
+        local body = res2.content
+        state.ipInfoOrg = body:match('"as"%s*:%s*"([^"]*)"') or body:match('"isp"%s*:%s*"([^"]*)"') or "-"
+        state.ipInfoTimezone = body:match('"timezone"%s*:%s*"([^"]*)"') or "-"
+        state.ipInfoPostal = body:match('"zip"%s*:%s*"([^"]*)"') or "-"
+
+        local city = body:match('"city"%s*:%s*"([^"]*)"') or ""
+        local region = body:match('"regionName"%s*:%s*"([^"]*)"') or ""
+        local country = body:match('"countryCode"%s*:%s*"([^"]*)"') or ""
+
+        local loc = {}
+        if city ~= "" then loc[#loc + 1] = city end
+        if region ~= "" and region ~= city then loc[#loc + 1] = region end
+        if country ~= "" then loc[#loc + 1] = country end
+        state.ipInfoLocation = #loc > 0 and table.concat(loc, ", ") or "-"
+    else
+        state.ipInfoLocation = "Timeout / Gagal mengambil data"
+    end
+end
+
+-- ==========================================
+-- FUNGSI PARSING AKUN TERKAIT
+-- ==========================================
+local function parseAccountLine(plainLine, rawLine, targetList, seenMap)
+    if plainLine:match("^%d+%s+matches") or plainLine:match("^[Ww]orking") or plainLine:match("^[Nn]o%s+matches") then
+        return
+    end
+
+    local statusPrefix, rest = plainLine:match("^([Oo][NnFf]+)%s*:%s*(.+)$")
+    local lineToScan = rest or plainLine
+    local accStatus = statusPrefix and statusPrefix:upper() or ""
+
+    local accName, accUid = lineToScan:match("^([%w_%-]+)%s+#(%d+)")
+    if not accName then
+        accName, accUid = lineToScan:match("^([%w_%-]+)%s*%(#?(%d+)%)")
+    end
+
+    if accName and accUid then
+        local score = plainLine:match("[Ss]core%s*:%s*(%d+)") or "-"
+        local key = accName:lower() .. "_" .. accUid
+        if not seenMap[key] then
+            seenMap[key] = true
+            targetList[#targetList + 1] = {
+                name = accName,
+                uid = accUid,
+                status = accStatus,
+                score = score,
+                raw = rawLine
+            }
+        end
+    end
+end
+
+-- ==========================================
+-- CARI NAMA PLAYER DARI NETID (UNTUK FITUR /wr)
+-- ==========================================
+local function getPlayerNameByNetID(targetNetId)
+    local ok, players = pcall(Client.GetPlayers)
+    if ok and players then
+        for _, p in ipairs(players) do
+            if tostring(p.netid) == tostring(targetNetId) then
+                local clean = stripColor(p.name):gsub("%b()", ""):gsub("%b[]", ""):match("^%s*(.-)%s*$")
+                local gidOnly = clean:match("([%w_%-]+)")
+                if gidOnly and gidOnly ~= "" then
+                    return gidOnly
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ==========================================
+-- HOOK: KLIK TOMBOL DI DIALOG
+-- ==========================================
+Script.On("OnDialogResult", "mod_proxy_dialog_click", function(text)
+    local btn = text:match("buttonClicked|([^\n]+)")
+    if not btn then return end
+
+    if btn == "btn_back_overview" then
+        showOverviewDialog()
+
+    elseif btn == "btn_act_ridcheck" then
+        if state.growid ~= "" then
+            pendingAction = "RID"
+        end
+
+    elseif btn == "btn_act_ipcheck" then
+        if state.growid ~= "" then
+            pendingAction = "IP"
+        end
+
+    elseif btn == "btn_act_ipinfo" then
+        pendingAction = "IPINFO"
+
+    elseif btn == "btn_act_inventory" then
+        if state.userid ~= "" then
+            state.injectBackInNextDialog = true
+            sendCmd("/viewinv " .. state.userid)
+        else
+            LogToConsole("`4[Proxy] UserID belum ditemukan!")
+        end
+
+    elseif btn == "btn_act_profile" then
+        if state.growid ~= "" then
+            state.injectBackInNextDialog = true
+            sendCmd("/profile /" .. state.growid)
+        end
+
+    else
+        local targetAcc = btn:match("^btn_inspect_acc_(.+)$")
+        if targetAcc then
+            pendingTarget = targetAcc
+            pendingAction = "INFO"
+        end
+    end
+end)
+
+-- ==========================================
+-- HANDLER PAKET KELUAR (/acc, /wr, DAN WRENCH PLAYER)
+-- ==========================================
+local function handleOutgoingPacket(kind, text)
+    if kind == 2 then
+        local msg = text:match("|text|([^\n]+)")
+        if msg then
+            local cleanCmd = msg:match("^%s*(.-)%s*$")
+
+            if cleanCmd:lower() == "/wr" then
+                state.wrenchMode = not state.wrenchMode
+                if state.wrenchMode then
+                    LogToConsole("`2[Proxy] Mode Wrench Inspect (/wr): AKTIF! Klik player dengan wrench.")
+                else
+                    LogToConsole("`4[Proxy] Mode Wrench Inspect (/wr): NONAKTIF.")
+                end
+                return true
+            end
+
+            local target = cleanCmd:match("^/[Aa][Cc][Cc]%s+/?(%S+)")
+            if target then
+                pendingTarget = target
+                pendingAction = "INFO"
+                return true
+            end
+        end
+
+        if state.wrenchMode and text:find("action|wrench", 1, true) then
+            local netid = text:match("netid|(%d+)")
+            if netid then
+                local pName = getPlayerNameByNetID(netid)
+                if pName then
+                    pendingTarget = pName
+                    pendingAction = "INFO"
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+AddHook("OnSendPacket", "mod_proxy_packets_1", handleOutgoingPacket)
+
+-- ==========================================
+-- HANDLER DIALOG SERVER (BACK BUTTON & WRENCH INTERCEPT)
+-- ==========================================
+local function handleIncomingDialog(dlg)
+    if not dlg or dlg:find("proxy_", 1, true) then
+        return false
+    end
+
+    if state.wrenchMode and not state.injectBackInNextDialog then
+        if dlg:find("embed_data|netID", 1, true) or dlg:find("player_info", 1, true) or dlg:find("add_player_info", 1, true) or dlg:find("popup", 1, true) then
+            local netid = dlg:match("netID|(%d+)")
+            if netid then
+                local pName = getPlayerNameByNetID(netid)
+                if pName then
+                    pendingTarget = pName
+                    pendingAction = "INFO"
+                    return true
+                end
+            end
+        end
+    end
+
+    if state.injectBackInNextDialog then
+        state.injectBackInNextDialog = false
+        local modifiedDlg = dlg:gsub("(end_dialog|[^\n]+)", "add_spacer|small|\nadd_button|btn_back_overview|`wBack to Account Info``|noflags|0|0|\n%1")
+        Client.ShowDialog(modifiedDlg)
+        return true
+    end
+
+    return false
+end
+
+if Script and Script.On then
+    Script.On("OnDialogRequest", "mod_proxy_dlg_req", function(dlg)
+        return handleIncomingDialog(tostring(dlg))
+    end)
+end
+
+-- ==========================================
+-- HOOK: PARSING CONSOLE & VARIANT
+-- ==========================================
+AddHook("OnVariant", "mod_proxy_variant", function(v)
+    if v[0] == "OnDialogRequest" then
+        if handleIncomingDialog(tostring(v[1])) then
+            return true
+        end
+    end
+
+    if v[0] == "OnConsoleMessage" then
+        local rawMsg = tostring(v[1])
+        local plainAll = stripColor(rawMsg)
+
+        if plainAll:find("[Proxy]", 1, true) then
+            return false
+        end
+
+        if state.capturing then
+            for rawLine in rawMsg:gmatch("([^\r\n]+)") do
+                local plain = stripColor(rawLine)
+
+                if state.capturePhase == "INFO" then
+                    local realName = plain:match("Name:%s*([^,]+)")
+                    if realName then state.growid = realName:match("^%s*(.-)%s*$") end
+
+                    local uid = plain:match("%(#(%d+)%)") or plain:match("[Uu]ser%s*[Ii][Dd]%s*:%s*(%d+)")
+                    if uid then state.userid = uid end
+
+                    local dcDate = plain:match("[Dd]ate[Cc]reated%s*:%s*([^,]+)")
+                    if dcDate then state.dateCreated = dcDate:match("^%s*(.-)%s*$") end
+
+                    local llDate = plain:match("[Dd]ate[Ll]ast[Ll]ogin%s*:%s*([^,]+)")
+                    if llDate then state.lastLogin = llDate:match("^%s*(.-)%s*$") end
+
+                    local dc = plain:match("[Dd]iscord[Uu]ser%s*:%s*%(([^%)]+)%)") or plain:match("[Dd]iscord[Uu]ser%s*:%s*([^,%s]+)")
+                    if dc then state.discord = dc end
+
+                    local vf = plain:match("[Vv]erified%s*:%s*([^%),]+)")
+                    if vf then
+                        local vLower = vf:match("^%s*(.-)%s*$"):lower()
+                        state.verified = (vLower == "yes" or vLower == "true" or vLower == "1") and "Iya" or "Tidak"
+                    end
+
+                    local hrs = plain:match("[Hh]rs%s*:%s*([%d%.]+)")
+                    if hrs then state.hrs = hrs end
+
+                    local ipAddr = plain:match("IP:%s*(%d+%.%d+%.%d+%.%d+)") or plain:match("(%d+%.%d+%.%d+%.%d+)")
+                    if ipAddr and state.ip == "-" then state.ip = ipAddr end
+
+                elseif state.capturePhase == "RID" then
+                    if plain:match("matches") then
+                        state.ridHeader = rawLine
+                    else
+                        parseAccountLine(plain, rawLine, state.ridAccounts, state.seenRid)
+                    end
+
+                elseif state.capturePhase == "IP" then
+                    if plain:match("matches") then
+                        state.ipHeader = rawLine
+                    else
+                        parseAccountLine(plain, rawLine, state.ipAccounts, state.seenIp)
+                    end
+                end
+            end
+
+            return true
+        end
+    end
+
+    return false
+end)
+
+-- ==========================================
+-- LOOP UTAMA
+-- ==========================================
+LogToConsole("`2[Proxy Moderation] Aktif! Gunakan `w/acc <growid> `2atau ketik `w/wr `2untuk mode Wrench.")
+
+while true do
+    if pendingAction == "INFO" and pendingTarget then
+        local gid = tostring(pendingTarget):gsub("^/", ""):match("^%s*(.-)%s*$")
+        pendingTarget = nil
+        pendingAction = nil
+
+        if gid ~= "" then
+            state.growid = gid
+            state.userid = ""
+            state.dateCreated = "-"
+            state.lastLogin = "-"
+            state.verified = "Tidak"
+            state.discord = "-"
+            state.hrs = "-"
+            state.ip = "-"
+            state.ridHeader = ""
+            state.ridAccounts = {}
+            state.seenRid = {}
+            state.ipHeader = ""
+            state.ipAccounts = {}
+            state.seenIp = {}
+            state.ipInfoOrg = "-"
+            state.ipInfoHostname = "-"
+            state.ipInfoLocation = "-"
+            state.ipInfoTimezone = "-"
+            state.ipInfoPostal = "-"
+
+            state.capturing = true
+            state.capturePhase = "INFO"
+
+            LogToConsole("`9[Proxy] Mohon ditunggu, mengambil /info `w" .. gid .. "`9...")
+            sendCmd("/info /" .. gid)
+            Sleep(CMD_DELAY)
+
+            state.capturing = false
+            state.capturePhase = nil
+
+            showOverviewDialog()
+        end
+
+    elseif pendingAction == "RID" then
+        pendingAction = nil
+        state.ridHeader = ""
+        state.ridAccounts = {}
+        state.seenRid = {}
+
+        state.capturing = true
+        state.capturePhase = "RID"
+
+        LogToConsole("`9[Proxy] Mohon ditunggu, menjalankan /ridcheck `w" .. state.growid .. "`9...")
+        sendCmd("/ridcheck /" .. state.growid)
+        Sleep(CMD_DELAY)
+
+        state.capturing = false
+        state.capturePhase = nil
+
+        showRidResultDialog()
+
+    elseif pendingAction == "IP" then
+        pendingAction = nil
+        state.ipHeader = ""
+        state.ipAccounts = {}
+        state.seenIp = {}
+
+        state.capturing = true
+        state.capturePhase = "IP"
+
+        LogToConsole("`9[Proxy] Mohon ditunggu, menjalankan /ipcheck `w" .. state.growid .. "`9...")
+        sendCmd("/ipcheck /" .. state.growid)
+        Sleep(CMD_DELAY)
+
+        state.capturing = false
+        state.capturePhase = nil
+
+        showIpCheckResultDialog()
+
+    elseif pendingAction == "IPINFO" then
+        pendingAction = nil
+        LogToConsole("`9[Proxy] Mohon ditunggu, mengambil data IPInfo (`w" .. state.ip .. "`9)...")
+        fetchIpInfoData(state.ip)
+        showIpInfoDialog()
+    end
+
+    Sleep(100)
+end
